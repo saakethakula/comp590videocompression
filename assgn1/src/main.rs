@@ -19,23 +19,28 @@ use toy_ac::symbol_model::SymbolModel;
 use ffmpeg_sidecar::event::StreamTypeSpecificData::Video;
 
 #[derive(Clone)]
-struct AdaptiveByteModel {
+struct ContextModel {
     symbols: [u8; 256],
     counts: [u32; 256],
     total: u32,
 }
 
-impl AdaptiveByteModel {
+impl ContextModel {
     fn new() -> Self {
+        let mut symbols = [0u8; 256];
+        for i in 0..256 {
+            symbols[i] = i as u8;
+        }
+
         Self {
-            symbols: std::array::from_fn(|idx| idx as u8),
+            symbols,
             counts: [1; 256],
             total: 256,
         }
     }
 
-    fn incr_count(&mut self, symbol: u8) {
-        self.counts[symbol as usize] += 1;
+    fn update(&mut self, value: u8) {
+        self.counts[value as usize] += 1;
         self.total += 1;
         self.normalize();
     }
@@ -52,7 +57,7 @@ impl AdaptiveByteModel {
     }
 }
 
-impl SymbolModel<u8> for AdaptiveByteModel {
+impl SymbolModel<u8> for ContextModel {
     fn contains(&self, _s: &u8) -> bool {
         true
     }
@@ -87,31 +92,31 @@ impl SymbolModel<u8> for AdaptiveByteModel {
     }
 }
 
-fn clamped_gradient_predictor(left: u8, up: u8, up_left: u8) -> u8 {
+fn grad_predict(left: u8, up: u8, up_left: u8) -> u8 {
     let value = left as i16 + up as i16 - up_left as i16;
     value.clamp(0, 255) as u8
 }
 
-fn predict_pixel(prior_frame: &[u8], decoded_frame: &[u8], width: usize, row: usize, col: usize) -> u8 {
-    let pixel_index = row * width + col;
-    let prev = prior_frame[pixel_index];
+fn get_prediction(last_frame: &[u8], current_frame: &[u8], width: usize, row: usize, col: usize) -> u8 {
+    let idx = row * width + col;
+    let prev = last_frame[idx];
     let left = if col > 0 {
-        decoded_frame[pixel_index - 1]
+        current_frame[idx - 1]
     } else {
         prev
     };
     let up = if row > 0 {
-        decoded_frame[pixel_index - width]
+        current_frame[idx - width]
     } else {
         prev
     };
     let up_left = if row > 0 && col > 0 {
-        decoded_frame[pixel_index - width - 1]
+        current_frame[idx - width - 1]
     } else {
         prev
     };
-    let spatial = clamped_gradient_predictor(left, up, up_left);
-    ((spatial as u16 + prev as u16 + 1) / 2) as u8
+    let spatial_guess = grad_predict(left, up, up_left);
+    ((spatial_guess as u16 + prev as u16 + 1) / 2) as u8
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -202,7 +207,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = Encoder::new();
 
     // Set up arithmetic coding context(s)
-    let mut context_models = vec![AdaptiveByteModel::new(); 256];
+    let mut models = vec![ContextModel::new(); 256];
     let mut encoded_frames = 0_u32;
 
     // Process frames
@@ -212,8 +217,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Skipping frame {}", frame.frame_num);
             }
         } else if frame.frame_num < skip_count + count {
-            let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
-            let mut reconstructed_frame = vec![0_u8; current_frame.len()];
+            let current_frame: Vec<u8> = frame.data;
+            let mut so_far = vec![0_u8; current_frame.len()];
 
             let bits_written_at_start = enc.bits_written();
 
@@ -221,16 +226,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for r in 0..height as usize {
                 for c in 0..width as usize {
                     let pixel_index = r * width as usize + c;
-                    let predictor =
-                        predict_pixel(&prior_frame, &reconstructed_frame, width as usize, r, c);
-                    let context = predictor as usize;
+                    let prediction = get_prediction(&prior_frame, &so_far, width as usize, r, c);
+                    let ctx = prediction as usize;
 
-                    let residual = current_frame[pixel_index].wrapping_sub(predictor);
+                    let diff = current_frame[pixel_index].wrapping_sub(prediction);
 
-                    enc.encode(&residual, &context_models[context], &mut bw);
+                    enc.encode(&diff, &models[ctx], &mut bw);
 
-                    context_models[context].incr_count(residual);
-                    reconstructed_frame[pixel_index] = predictor.wrapping_add(residual);
+                    models[ctx].update(diff);
+                    so_far[pixel_index] = prediction.wrapping_add(diff);
                 }
             }
 
@@ -275,7 +279,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut dec = Decoder::new();
 
-        let mut context_models = vec![AdaptiveByteModel::new(); 256];
+        let mut models = vec![ContextModel::new(); 256];
 
         // Set up initial prior frame as uniform medium gray
         let mut prior_frame = vec![128 as u8; (width * height) as usize];
@@ -289,21 +293,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     print!("Checking frame: {} ... ", frame.frame_num);
                 }
 
-                let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
-                let mut reconstructed_frame = vec![0_u8; current_frame.len()];
+                let current_frame: Vec<u8> = frame.data;
+                let mut so_far = vec![0_u8; current_frame.len()];
 
                 // Process pixels in row major order.
                 for r in 0..height as usize {
                     for c in 0..width as usize {
                         let pixel_index = r * width as usize + c;
-                        let predictor =
-                            predict_pixel(&prior_frame, &reconstructed_frame, width as usize, r, c);
-                        let context = predictor as usize;
-                        let residual = *dec.decode(&context_models[context], &mut br);
-                        context_models[context].incr_count(residual);
+                        let prediction = get_prediction(&prior_frame, &so_far, width as usize, r, c);
+                        let ctx = prediction as usize;
+                        let diff = *dec.decode(&models[ctx], &mut br);
+                        models[ctx].update(diff);
 
-                        let pixel_value = predictor.wrapping_add(residual);
-                        reconstructed_frame[pixel_index] = pixel_value;
+                        let pixel_value = prediction.wrapping_add(diff);
+                        so_far[pixel_index] = pixel_value;
 
                         if pixel_value != current_frame[pixel_index] {
                             println!(
