@@ -14,9 +14,105 @@ use bitbit::MSB;
 
 use toy_ac::decoder::Decoder;
 use toy_ac::encoder::Encoder;
-use toy_ac::symbol_model::VectorCountSymbolModel;
+use toy_ac::symbol_model::SymbolModel;
 
 use ffmpeg_sidecar::event::StreamTypeSpecificData::Video;
+
+#[derive(Clone)]
+struct AdaptiveByteModel {
+    symbols: [u8; 256],
+    counts: [u32; 256],
+    total: u32,
+}
+
+impl AdaptiveByteModel {
+    fn new() -> Self {
+        Self {
+            symbols: std::array::from_fn(|idx| idx as u8),
+            counts: [1; 256],
+            total: 256,
+        }
+    }
+
+    fn incr_count(&mut self, symbol: u8) {
+        self.counts[symbol as usize] += 1;
+        self.total += 1;
+        self.normalize();
+    }
+
+    fn normalize(&mut self) {
+        while self.total >= 1_000_000 {
+            let mut new_total = 0;
+            for count in &mut self.counts {
+                *count = if *count < 3 { 1 } else { *count / 2 };
+                new_total += *count;
+            }
+            self.total = new_total;
+        }
+    }
+}
+
+impl SymbolModel<u8> for AdaptiveByteModel {
+    fn contains(&self, _s: &u8) -> bool {
+        true
+    }
+
+    fn total(&self) -> u32 {
+        self.total
+    }
+
+    fn interval(&self, s: &u8) -> (u32, u32) {
+        let idx = *s as usize;
+        let mut sum = 0;
+        for i in 0..idx {
+            sum += self.counts[i];
+        }
+        (sum, sum + self.counts[idx])
+    }
+
+    fn lookup(&self, v: u32) -> (&u8, u32, u32) {
+        if v >= self.total {
+            panic!("Lookup value out of range");
+        }
+
+        let mut sum = 0;
+        for idx in 0..256 {
+            let next = sum + self.counts[idx];
+            if v < next {
+                return (&self.symbols[idx], sum, next);
+            }
+            sum = next;
+        }
+        panic!("Lookup failed");
+    }
+}
+
+fn clamped_gradient_predictor(left: u8, up: u8, up_left: u8) -> u8 {
+    let value = left as i16 + up as i16 - up_left as i16;
+    value.clamp(0, 255) as u8
+}
+
+fn predict_pixel(prior_frame: &[u8], decoded_frame: &[u8], width: usize, row: usize, col: usize) -> u8 {
+    let pixel_index = row * width + col;
+    let prev = prior_frame[pixel_index];
+    let left = if col > 0 {
+        decoded_frame[pixel_index - 1]
+    } else {
+        prev
+    };
+    let up = if row > 0 {
+        decoded_frame[pixel_index - width]
+    } else {
+        prev
+    };
+    let up_left = if row > 0 && col > 0 {
+        decoded_frame[pixel_index - width - 1]
+    } else {
+        prev
+    };
+    let spatial = clamped_gradient_predictor(left, up, up_left);
+    ((spatial as u16 + prev as u16 + 1) / 2) as u8
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Make sure ffmpeg is installed
@@ -106,7 +202,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = Encoder::new();
 
     // Set up arithmetic coding context(s)
-    let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
+    let mut context_models = vec![AdaptiveByteModel::new(); 256];
+    let mut encoded_frames = 0_u32;
 
     // Process frames
     for frame in iter.filter_frames() {
@@ -116,29 +213,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else if frame.frame_num < skip_count + count {
             let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
+            let mut reconstructed_frame = vec![0_u8; current_frame.len()];
 
             let bits_written_at_start = enc.bits_written();
 
             // Process pixels in row major order.
-            for r in 0..height {
-                for c in 0..width {
-                    let pixel_index = (r * width + c) as usize;
+            for r in 0..height as usize {
+                for c in 0..width as usize {
+                    let pixel_index = r * width as usize + c;
+                    let predictor =
+                        predict_pixel(&prior_frame, &reconstructed_frame, width as usize, r, c);
+                    let context = predictor as usize;
 
-                    // Encode difference with same pixel in prior frame.
-                    // Normalize and modulate difference to 8-bit range.
-                    let pixel_difference = (((current_frame[pixel_index] as i32)
-                        - (prior_frame[pixel_index] as i32))
-                        + 256)
-                        % 256;
+                    let residual = current_frame[pixel_index].wrapping_sub(predictor);
 
-                    enc.encode(&pixel_difference, &pixel_difference_pdf, &mut bw);
+                    enc.encode(&residual, &context_models[context], &mut bw);
 
-                    // Update context
-                    pixel_difference_pdf.incr_count(&pixel_difference);
+                    context_models[context].incr_count(residual);
+                    reconstructed_frame[pixel_index] = predictor.wrapping_add(residual);
                 }
             }
 
             prior_frame = current_frame;
+            encoded_frames += 1;
 
             let bits_written_at_end = enc.bits_written();
 
@@ -178,30 +275,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut dec = Decoder::new();
 
-        let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
+        let mut context_models = vec![AdaptiveByteModel::new(); 256];
 
         // Set up initial prior frame as uniform medium gray
         let mut prior_frame = vec![128 as u8; (width * height) as usize];
 
         'outer_loop: 
         for frame in iter.filter_frames() {
-            if frame.frame_num < skip_count + count {
+            if frame.frame_num < skip_count {
+                continue;
+            } else if frame.frame_num < skip_count + encoded_frames {
                 if verbose {
                     print!("Checking frame: {} ... ", frame.frame_num);
                 }
 
                 let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
+                let mut reconstructed_frame = vec![0_u8; current_frame.len()];
 
                 // Process pixels in row major order.
-                for r in 0..height {
-                    for c in 0..width {
-                        let pixel_index = (r * width + c) as usize;
-                        let decoded_pixel_difference = dec.decode(&pixel_difference_pdf, &mut br).to_owned();
-                        pixel_difference_pdf.incr_count(&decoded_pixel_difference);
+                for r in 0..height as usize {
+                    for c in 0..width as usize {
+                        let pixel_index = r * width as usize + c;
+                        let predictor =
+                            predict_pixel(&prior_frame, &reconstructed_frame, width as usize, r, c);
+                        let context = predictor as usize;
+                        let residual = *dec.decode(&context_models[context], &mut br);
+                        context_models[context].incr_count(residual);
 
-                        let pixel_value = (prior_frame[pixel_index] as i32 + decoded_pixel_difference) % 256;
+                        let pixel_value = predictor.wrapping_add(residual);
+                        reconstructed_frame[pixel_index] = pixel_value;
 
-                        if pixel_value != current_frame[pixel_index] as i32 {
+                        if pixel_value != current_frame[pixel_index] {
                             println!(
                                 " error at ({}, {}), should decode {}, got {}",
                                 c, r, current_frame[pixel_index], pixel_value
@@ -221,12 +325,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Emit report
     if report {
-        println!(
-            "{} frames encoded, average size (bits): {}, compression ratio: {:.2}",
-            count,
-            enc.bits_written() / count as u64,
-            (width * height * 8 * count) as f64 / enc.bits_written() as f64
-        )
+        if encoded_frames == 0 {
+            println!("0 frames encoded");
+        } else {
+            println!(
+                "{} frames encoded, average size (bits): {}, compression ratio: {:.2}",
+                encoded_frames,
+                enc.bits_written() / encoded_frames as u64,
+                (width * height * 8 * encoded_frames) as f64 / enc.bits_written() as f64
+            )
+        }
     }
 
     Ok(())
